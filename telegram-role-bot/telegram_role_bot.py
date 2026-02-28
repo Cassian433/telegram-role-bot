@@ -325,12 +325,23 @@ async def fetch_reddit_profile(username):
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=headers, follow_redirects=True, timeout=15)
-            if resp.status_code in (404, 403):
-                return {"suspended": True}
+
+            # 429 = explicit rate limit
             if resp.status_code == 429:
                 return {"rate_limited": True}
+
+            # 403 = could be rate limit OR blocked, treat as rate limit to be safe
+            if resp.status_code == 403:
+                logger.warning(f"Got 403 for u/{username} — treating as rate limit (not suspended)")
+                return {"rate_limited": True}
+
+            # 404 = account doesn't exist / truly suspended
+            if resp.status_code == 404:
+                return {"suspended": True}
+
             if resp.status_code != 200:
                 return None
+
             data = resp.json().get("data", {})
 
             if data.get("is_suspended"):
