@@ -441,6 +441,103 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
             # Rate limit: 2s between Reddit requests
             await asyncio.sleep(2)
 
+        # ── Also check WARMUP accounts for bans ──────────────────────────────
+        warmup_banned = []
+        try:
+            warmup_records = get_table(TABLE_WARMUP).all()
+            warmup_active = [r for r in warmup_records if safe_get(r, "Status") in ("Warming", "Ready")]
+            logger.info(f"Checking {len(warmup_active)} warmup accounts for bans...")
+
+            for r in warmup_active:
+                username = safe_get(r, "Reddit Username", "").strip()
+                if not username:
+                    continue
+
+                profile = await fetch_reddit_profile(username)
+                if not profile:
+                    errors += 1
+                    await asyncio.sleep(3)
+                    continue
+
+                if profile.get("rate_limited"):
+                    logger.warning("Reddit rate limited during warmup check, pausing 60s...")
+                    await asyncio.sleep(60)
+                    profile = await fetch_reddit_profile(username)
+                    if not profile or profile.get("rate_limited"):
+                        errors += 1
+                        continue
+
+                if profile.get("suspended"):
+                    va = safe_get(r, "VA", "N/A")
+                    model = safe_get(r, "Model", "N/A")
+                    try:
+                        get_table(TABLE_WARMUP).update(r["id"], {"Status": "Banned"})
+                    except Exception:
+                        pass
+                    proxy = safe_get(r, "Proxy Used", "").strip()
+                    proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ Proxy not mentioned"
+                    warmup_banned.append(f"u/{username} ({va} / {model})\n      📍 Warmup | {proxy_tag}")
+                    # Pre-register in known_bans so poll_bans doesn't double-alert
+                    _cfg = load_config()
+                    _known = set(_cfg.get("known_bans", []))
+                    _known.add(f"{TABLE_WARMUP}:{username}")
+                    _cfg["known_bans"] = list(_known)
+                    save_config(_cfg)
+
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Warmup ban check error: {e}\n{traceback.format_exc()}")
+
+        # ── Also check BLANKS accounts for bans ──────────────────────────────
+        blanks_banned = []
+        try:
+            blanks_records = get_table(TABLE_BLANKS).all()
+            blanks_active = [r for r in blanks_records if safe_get(r, "Status") in ("Available", "Taken")]
+            logger.info(f"Checking {len(blanks_active)} blanks accounts for bans...")
+
+            for r in blanks_active:
+                username = safe_get(r, "Reddit Username", "").strip()
+                if not username:
+                    continue
+
+                profile = await fetch_reddit_profile(username)
+                if not profile:
+                    errors += 1
+                    await asyncio.sleep(3)
+                    continue
+
+                if profile.get("rate_limited"):
+                    logger.warning("Reddit rate limited during blanks check, pausing 60s...")
+                    await asyncio.sleep(60)
+                    profile = await fetch_reddit_profile(username)
+                    if not profile or profile.get("rate_limited"):
+                        errors += 1
+                        continue
+
+                if profile.get("suspended"):
+                    va = safe_get(r, "VA", safe_get(r, "Created By", "N/A"))
+                    model = safe_get(r, "Model", "N/A")
+                    try:
+                        get_table(TABLE_BLANKS).update(r["id"], {"Status": "Banned"})
+                    except Exception:
+                        pass
+                    proxy = safe_get(r, "Proxy Used", "").strip()
+                    proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ Proxy not mentioned"
+                    blanks_banned.append(f"u/{username} ({va} / {model})\n      📍 Blanks | {proxy_tag}")
+                    # Pre-register in known_bans so poll_bans doesn't double-alert
+                    _cfg = load_config()
+                    _known = set(_cfg.get("known_bans", []))
+                    _known.add(f"{TABLE_BLANKS}:{username}")
+                    _cfg["known_bans"] = list(_known)
+                    save_config(_cfg)
+
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Blanks ban check error: {e}\n{traceback.format_exc()}")
+
+        # Combine all banned lists
+        all_suspended = suspended_list + warmup_banned + blanks_banned
+
         # Mark first refresh as done
         if is_first_refresh:
             cfg = load_config()
@@ -448,19 +545,21 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
             save_config(cfg)
 
         logger.info(
-            f"Account update done: {updated} updated, {len(suspended_list)} newly banned, {errors} errors"
+            f"Account update done: {updated} updated, {len(all_suspended)} newly banned "
+            f"(posting:{len(suspended_list)} warmup:{len(warmup_banned)} blanks:{len(blanks_banned)}), "
+            f"{errors} errors"
         )
 
         # Alert ban channel about newly discovered suspensions (skip first run)
-        if suspended_list and not is_first_refresh:
+        if all_suspended and not is_first_refresh:
             cfg = load_config()
             ban_channel = cfg.get("ban_channel")
             if ban_channel:
                 text = (
-                    f"<b>🔄 Auto-Refresh Found {len(suspended_list)} Banned Accounts</b>\n"
+                    f"<b>🔄 Auto-Refresh Found {len(all_suspended)} Banned Accounts</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n\n"
                 )
-                for s in suspended_list:
+                for s in all_suspended:
                     text += f"🚫 {s}\n"
                 text += f"\n<i>Status auto-updated to Banned on Airtable</i>"
                 kwargs = {"chat_id": int(ban_channel["chat_id"]), "text": text, "parse_mode": ParseMode.HTML}
