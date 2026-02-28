@@ -441,99 +441,66 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
             # Rate limit: 2s between Reddit requests
             await asyncio.sleep(2)
 
-        # ── Also check WARMUP accounts for bans ──────────────────────────────
+        # ── Also check WARMUP & BLANKS accounts for bans (batched) ────────────
+        SCHED_BATCH = 10
+        SCHED_BATCH_PAUSE = 15
+        SCHED_REQ_DELAY = 3
+
+        extra_tables = [
+            (TABLE_WARMUP, "Warmup", ["Warming", "Ready"]),
+            (TABLE_BLANKS, "Blanks", ["Available", "Taken"]),
+        ]
         warmup_banned = []
-        try:
-            warmup_records = get_table(TABLE_WARMUP).all()
-            warmup_active = [r for r in warmup_records if safe_get(r, "Status") in ("Warming", "Ready")]
-            logger.info(f"Checking {len(warmup_active)} warmup accounts for bans...")
-
-            for r in warmup_active:
-                username = safe_get(r, "Reddit Username", "").strip()
-                if not username:
-                    continue
-
-                profile = await fetch_reddit_profile(username)
-                if not profile:
-                    errors += 1
-                    await asyncio.sleep(3)
-                    continue
-
-                if profile.get("rate_limited"):
-                    logger.warning("Reddit rate limited during warmup check, pausing 60s...")
-                    await asyncio.sleep(60)
-                    profile = await fetch_reddit_profile(username)
-                    if not profile or profile.get("rate_limited"):
-                        errors += 1
-                        continue
-
-                if profile.get("suspended"):
-                    va = safe_get(r, "VA", "N/A")
-                    model = safe_get(r, "Model", "N/A")
-                    try:
-                        get_table(TABLE_WARMUP).update(r["id"], {"Status": "Banned"})
-                    except Exception:
-                        pass
-                    proxy = safe_get(r, "Proxy Used", "").strip()
-                    proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ Proxy not mentioned"
-                    warmup_banned.append(f"u/{username} ({va} / {model})\n      📍 Warmup | {proxy_tag}")
-                    # Pre-register in known_bans so poll_bans doesn't double-alert
-                    _cfg = load_config()
-                    _known = set(_cfg.get("known_bans", []))
-                    _known.add(f"{TABLE_WARMUP}:{username}")
-                    _cfg["known_bans"] = list(_known)
-                    save_config(_cfg)
-
-                await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Warmup ban check error: {e}\n{traceback.format_exc()}")
-
-        # ── Also check BLANKS accounts for bans ──────────────────────────────
         blanks_banned = []
-        try:
-            blanks_records = get_table(TABLE_BLANKS).all()
-            blanks_active = [r for r in blanks_records if safe_get(r, "Status") in ("Available", "Taken")]
-            logger.info(f"Checking {len(blanks_active)} blanks accounts for bans...")
+        stage_lists = {"Warmup": warmup_banned, "Blanks": blanks_banned}
 
-            for r in blanks_active:
-                username = safe_get(r, "Reddit Username", "").strip()
-                if not username:
-                    continue
+        for table_id, stage, active_statuses in extra_tables:
+            try:
+                records = get_table(table_id).all()
+                stage_active = [r for r in records if safe_get(r, "Status") in active_statuses]
+                to_check = [(r, safe_get(r, "Reddit Username", "").strip()) for r in stage_active]
+                to_check = [(r, u) for r, u in to_check if u]
+                logger.info(f"Checking {len(to_check)} {stage} accounts for bans...")
 
-                profile = await fetch_reddit_profile(username)
-                if not profile:
-                    errors += 1
-                    await asyncio.sleep(3)
-                    continue
+                for i, (r, username) in enumerate(to_check):
+                    # Batch pause
+                    if i > 0 and i % SCHED_BATCH == 0:
+                        logger.info(f"{stage} ban check: {i}/{len(to_check)} done, pausing {SCHED_BATCH_PAUSE}s...")
+                        await asyncio.sleep(SCHED_BATCH_PAUSE)
 
-                if profile.get("rate_limited"):
-                    logger.warning("Reddit rate limited during blanks check, pausing 60s...")
-                    await asyncio.sleep(60)
                     profile = await fetch_reddit_profile(username)
-                    if not profile or profile.get("rate_limited"):
+                    if not profile:
                         errors += 1
+                        await asyncio.sleep(SCHED_REQ_DELAY)
                         continue
 
-                if profile.get("suspended"):
-                    va = safe_get(r, "VA", safe_get(r, "Created By", "N/A"))
-                    model = safe_get(r, "Model", "N/A")
-                    try:
-                        get_table(TABLE_BLANKS).update(r["id"], {"Status": "Banned"})
-                    except Exception:
-                        pass
-                    proxy = safe_get(r, "Proxy Used", "").strip()
-                    proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ Proxy not mentioned"
-                    blanks_banned.append(f"u/{username} ({va} / {model})\n      📍 Blanks | {proxy_tag}")
-                    # Pre-register in known_bans so poll_bans doesn't double-alert
-                    _cfg = load_config()
-                    _known = set(_cfg.get("known_bans", []))
-                    _known.add(f"{TABLE_BLANKS}:{username}")
-                    _cfg["known_bans"] = list(_known)
-                    save_config(_cfg)
+                    if profile.get("rate_limited"):
+                        logger.warning(f"Reddit rate limited during {stage} check, pausing 90s...")
+                        await asyncio.sleep(90)
+                        profile = await fetch_reddit_profile(username)
+                        if not profile or profile.get("rate_limited"):
+                            errors += 1
+                            continue
 
-                await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Blanks ban check error: {e}\n{traceback.format_exc()}")
+                    if profile.get("suspended"):
+                        va = safe_get(r, "VA", safe_get(r, "Created By", "N/A"))
+                        model = safe_get(r, "Model", "N/A")
+                        try:
+                            get_table(table_id).update(r["id"], {"Status": "Banned"})
+                        except Exception:
+                            pass
+                        proxy = safe_get(r, "Proxy Used", "").strip()
+                        proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ Proxy not mentioned"
+                        stage_lists[stage].append(f"u/{username} ({va} / {model})\n      📍 {stage} | {proxy_tag}")
+                        _cfg = load_config()
+                        _known = set(_cfg.get("known_bans", []))
+                        _known.add(f"{table_id}:{username}")
+                        _cfg["known_bans"] = list(_known)
+                        save_config(_cfg)
+
+                    await asyncio.sleep(SCHED_REQ_DELAY)
+            except Exception as e:
+                logger.error(f"{stage} ban check error: {e}\n{traceback.format_exc()}")
 
         # Combine all banned lists
         all_suspended = suspended_list + warmup_banned + blanks_banned
@@ -664,7 +631,11 @@ async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         return await reply(update, "Admin only.")
 
-    await reply(update, "🔍 Scanning ALL accounts across Blanks, Warmup & Posting for bans...\nThis may take a few minutes.")
+    BATCH_SIZE = 10
+    BATCH_PAUSE = 15  # seconds between batches
+    REQUEST_DELAY = 3  # seconds between individual requests
+
+    await reply(update, "🔍 Scanning ALL accounts across Blanks, Warmup & Posting for bans...\nProcessing in batches of 10 to avoid rate limits.")
 
     try:
         tables_to_scan = [
@@ -682,22 +653,35 @@ async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             records = get_table(table_id).all()
             active = [r for r in records if safe_get(r, "Status") in active_statuses]
 
+            # Filter to only those with usernames
+            to_check = [(r, safe_get(r, "Reddit Username", "").strip()) for r in active]
+            to_check = [(r, u) for r, u in to_check if u]
+
+            if not to_check:
+                continue
+
+            await reply(update, f"📋 <b>{stage}</b>: checking {len(to_check)} accounts...", parse_mode=ParseMode.HTML)
+
             stage_banned = 0
-            for r in active:
-                username = safe_get(r, "Reddit Username", "").strip()
-                if not username:
-                    continue
+            for i, (r, username) in enumerate(to_check):
+                # Batch pause: every BATCH_SIZE accounts, take a longer break
+                if i > 0 and i % BATCH_SIZE == 0:
+                    await reply(
+                        update,
+                        f"⏳ {stage}: checked {i}/{len(to_check)} — pausing {BATCH_PAUSE}s before next batch...",
+                    )
+                    await asyncio.sleep(BATCH_PAUSE)
 
                 total_checked += 1
                 profile = await fetch_reddit_profile(username)
                 if not profile:
                     errors += 1
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(REQUEST_DELAY)
                     continue
 
                 if profile.get("rate_limited"):
-                    await reply(update, f"⚠️ Reddit rate limited during {stage} scan, waiting 60s...")
-                    await asyncio.sleep(60)
+                    await reply(update, f"⚠️ Reddit rate limited during {stage} scan, waiting 90s...")
+                    await asyncio.sleep(90)
                     profile = await fetch_reddit_profile(username)
                     if not profile or profile.get("rate_limited"):
                         errors += 1
@@ -726,9 +710,16 @@ async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ No proxy"
                     ban_details.append(f"🚫 <b>u/{esc(username)}</b> — {stage} ({va} / {model})\n      {proxy_tag}")
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(REQUEST_DELAY)
 
-        # Build response
+            # Stage summary
+            await reply(
+                update,
+                f"✅ <b>{stage}</b> done: {len(to_check)} checked, {stage_banned} banned",
+                parse_mode=ParseMode.HTML,
+            )
+
+        # Build final response
         text = (
             f"<b>✅ Ban Scan Complete</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
