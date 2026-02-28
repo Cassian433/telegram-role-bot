@@ -656,6 +656,104 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, f"Error during refresh: {e}")
 
 
+# ── /checkbans ── On-demand ban scan across all stages ────────────────────────
+
+
+async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger: /checkbans — scan all warmup, blanks & posting accounts for Reddit bans."""
+    if not await is_admin(update, context):
+        return await reply(update, "Admin only.")
+
+    await reply(update, "🔍 Scanning ALL accounts across Blanks, Warmup & Posting for bans...\nThis may take a few minutes.")
+
+    try:
+        tables_to_scan = [
+            (TABLE_BLANKS, "Blanks", ["Available", "Taken"]),
+            (TABLE_WARMUP, "Warmup", ["Warming", "Ready"]),
+            (TABLE_POSTING, "Posting", ["Posting", "Dormant"]),
+        ]
+
+        total_checked = 0
+        total_banned = 0
+        errors = 0
+        ban_details = []
+
+        for table_id, stage, active_statuses in tables_to_scan:
+            records = get_table(table_id).all()
+            active = [r for r in records if safe_get(r, "Status") in active_statuses]
+
+            stage_banned = 0
+            for r in active:
+                username = safe_get(r, "Reddit Username", "").strip()
+                if not username:
+                    continue
+
+                total_checked += 1
+                profile = await fetch_reddit_profile(username)
+                if not profile:
+                    errors += 1
+                    await asyncio.sleep(3)
+                    continue
+
+                if profile.get("rate_limited"):
+                    await reply(update, f"⚠️ Reddit rate limited during {stage} scan, waiting 60s...")
+                    await asyncio.sleep(60)
+                    profile = await fetch_reddit_profile(username)
+                    if not profile or profile.get("rate_limited"):
+                        errors += 1
+                        continue
+
+                if profile.get("suspended"):
+                    stage_banned += 1
+                    total_banned += 1
+                    va = safe_get(r, "VA", safe_get(r, "Created By", "N/A"))
+                    model = safe_get(r, "Model", "N/A")
+                    proxy = safe_get(r, "Proxy Used", "").strip()
+
+                    # Update Airtable status to Banned
+                    try:
+                        get_table(table_id).update(r["id"], {"Status": "Banned"})
+                    except Exception:
+                        pass
+
+                    # Pre-register in known_bans
+                    _cfg = load_config()
+                    _known = set(_cfg.get("known_bans", []))
+                    _known.add(f"{table_id}:{username}")
+                    _cfg["known_bans"] = list(_known)
+                    save_config(_cfg)
+
+                    proxy_tag = f"🔒 {proxy}" if proxy else "⚠️ No proxy"
+                    ban_details.append(f"🚫 <b>u/{esc(username)}</b> — {stage} ({va} / {model})\n      {proxy_tag}")
+
+                await asyncio.sleep(2)
+
+        # Build response
+        text = (
+            f"<b>✅ Ban Scan Complete</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 Checked: <b>{total_checked}</b> accounts\n"
+            f"🚫 Newly banned: <b>{total_banned}</b>\n"
+        )
+        if errors:
+            text += f"⚠️ Errors: {errors}\n"
+
+        if ban_details:
+            text += f"\n{'━' * 18}\n\n"
+            for d in ban_details[:30]:
+                text += f"{d}\n\n"
+            if len(ban_details) > 30:
+                text += f"<i>...and {len(ban_details) - 30} more</i>\n"
+            text += f"\n<i>All statuses auto-updated to Banned in Airtable</i>"
+        else:
+            text += f"\n✨ <i>No new bans found — all accounts are alive!</i>"
+
+        await reply(update, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"checkbans error: {e}\n{traceback.format_exc()}")
+        await reply(update, f"Error during ban scan: {e}")
+
+
 # ── /postcheck ── Quick shadowban / account status check ─────────────────────
 
 
@@ -2381,6 +2479,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /needaccs — VAs low on accounts\n\n"
         "<b>Account Tools</b>\n"
         "  /refresh — Update karma/age from Reddit\n"
+        "  /checkbans — Scan all stages for Reddit bans\n"
         "  /postcheck — Shadowban checker\n"
         "  /topaccs — Highest karma accounts\n"
         "  /warnings — Accounts needing attention\n\n"
@@ -4043,6 +4142,7 @@ def main():
 
     # Account tools
     app.add_handler(CommandHandler("refresh", refresh_cmd))
+    app.add_handler(CommandHandler("checkbans", checkbans_cmd))
     app.add_handler(CommandHandler("postcheck", postcheck_cmd))
     app.add_handler(CommandHandler("reassign", assign_acc_cmd))
     app.add_handler(CommandHandler("topaccs", topaccs_cmd))
@@ -4138,6 +4238,7 @@ def main():
             ("needaccs", "VAs low on accounts"),
             # --- Account Tools ---
             ("refresh", "Update karma/age from Reddit"),
+            ("checkbans", "Scan all stages for bans"),
             ("postcheck", "Shadowban checker"),
             ("topaccs", "Highest karma accounts"),
             ("warnings", "Accounts needing attention"),
