@@ -375,24 +375,34 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
         active = [r for r in posting if safe_get(r, "Status") in ("Posting", "Dormant")]
         logger.info(f"Updating {len(active)} active/dormant accounts...")
 
+        SCHED_BATCH = 5
+        SCHED_BATCH_PAUSE = 30
+        SCHED_REQ_DELAY = 5
+        SCHED_RATE_LIMIT_PAUSE = 120
+
         updated = 0
         suspended_list = []  # track newly found suspensions
         errors = 0
 
-        for r in active:
+        for i, r in enumerate(active):
             username = safe_get(r, "Reddit Username", "").strip()
             if not username:
                 continue
 
+            # Batch pause
+            if i > 0 and i % SCHED_BATCH == 0:
+                logger.info(f"Posting ban check: {i}/{len(active)} done, pausing {SCHED_BATCH_PAUSE}s...")
+                await asyncio.sleep(SCHED_BATCH_PAUSE)
+
             profile = await fetch_reddit_profile(username)
             if not profile:
                 errors += 1
-                await asyncio.sleep(3)
+                await asyncio.sleep(SCHED_REQ_DELAY)
                 continue
 
             if profile.get("rate_limited"):
-                logger.warning("Reddit rate limited, pausing 60s...")
-                await asyncio.sleep(60)
+                logger.warning(f"Reddit rate limited, pausing {SCHED_RATE_LIMIT_PAUSE}s...")
+                await asyncio.sleep(SCHED_RATE_LIMIT_PAUSE)
                 profile = await fetch_reddit_profile(username)
                 if not profile or profile.get("rate_limited"):
                     errors += 1
@@ -416,7 +426,7 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
                     _known.add(f"{TABLE_POSTING}:{username}")
                     _cfg["known_bans"] = list(_known)
                     save_config(_cfg)
-                await asyncio.sleep(2)
+                await asyncio.sleep(SCHED_REQ_DELAY)
                 continue
 
             # Build update dict — only update fields that have changed
@@ -438,13 +448,9 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Airtable update error for u/{username}: {e}")
                     errors += 1
 
-            # Rate limit: 2s between Reddit requests
-            await asyncio.sleep(2)
+            await asyncio.sleep(SCHED_REQ_DELAY)
 
         # ── Also check WARMUP & BLANKS accounts for bans (batched) ────────────
-        SCHED_BATCH = 10
-        SCHED_BATCH_PAUSE = 15
-        SCHED_REQ_DELAY = 3
 
         extra_tables = [
             (TABLE_WARMUP, "Warmup", ["Warming", "Ready"]),
@@ -475,8 +481,8 @@ async def update_account_info_job(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     if profile.get("rate_limited"):
-                        logger.warning(f"Reddit rate limited during {stage} check, pausing 90s...")
-                        await asyncio.sleep(90)
+                        logger.warning(f"Reddit rate limited during {stage} check, pausing {SCHED_RATE_LIMIT_PAUSE}s...")
+                        await asyncio.sleep(SCHED_RATE_LIMIT_PAUSE)
                         profile = await fetch_reddit_profile(username)
                         if not profile or profile.get("rate_limited"):
                             errors += 1
@@ -567,8 +573,8 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             if profile.get("rate_limited"):
-                await reply(update, "⚠️ Reddit rate limited, waiting 60s...")
-                await asyncio.sleep(60)
+                await reply(update, "⚠️ Reddit rate limited, waiting 120s...")
+                await asyncio.sleep(120)
                 profile = await fetch_reddit_profile(username)
                 if not profile or profile.get("rate_limited"):
                     errors += 1
@@ -631,9 +637,10 @@ async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         return await reply(update, "Admin only.")
 
-    BATCH_SIZE = 10
-    BATCH_PAUSE = 15  # seconds between batches
-    REQUEST_DELAY = 3  # seconds between individual requests
+    BATCH_SIZE = 5
+    BATCH_PAUSE = 30   # seconds between batches
+    REQUEST_DELAY = 5   # seconds between individual requests
+    RATE_LIMIT_PAUSE = 120  # seconds when Reddit rate limits
 
     await reply(update, "🔍 Scanning ALL accounts across Blanks, Warmup & Posting for bans...\nProcessing in batches of 10 to avoid rate limits.")
 
@@ -680,8 +687,8 @@ async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 if profile.get("rate_limited"):
-                    await reply(update, f"⚠️ Reddit rate limited during {stage} scan, waiting 90s...")
-                    await asyncio.sleep(90)
+                    await reply(update, f"⚠️ Reddit rate limited during {stage} scan, waiting {RATE_LIMIT_PAUSE}s...")
+                    await asyncio.sleep(RATE_LIMIT_PAUSE)
                     profile = await fetch_reddit_profile(username)
                     if not profile or profile.get("rate_limited"):
                         errors += 1
