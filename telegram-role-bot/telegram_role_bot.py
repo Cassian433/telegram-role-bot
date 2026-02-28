@@ -763,6 +763,159 @@ async def checkbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, f"Error during ban scan: {e}")
 
 
+# ── /recoverbans ── Undo wrongly-banned accounts ─────────────────────────────
+
+
+async def recoverbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recover accounts wrongly marked as Banned — checks Reddit and reverts alive ones."""
+    if not await is_admin(update, context):
+        return await reply(update, "Admin only.")
+
+    BATCH_SIZE = 5
+    BATCH_PAUSE = 30
+    REQUEST_DELAY = 5
+    RATE_LIMIT_PAUSE = 120
+
+    # Default statuses to revert to when account is alive
+    REVERT_STATUS = {
+        TABLE_POSTING: "Posting",
+        TABLE_WARMUP: "Warming",
+        TABLE_BLANKS: "Available",
+    }
+
+    # Which tables to recover — check args
+    args = context.args
+    if args and args[0].lower() == "posting":
+        tables_to_scan = [(TABLE_POSTING, "Posting")]
+    elif args and args[0].lower() == "warmup":
+        tables_to_scan = [(TABLE_WARMUP, "Warmup")]
+    elif args and args[0].lower() == "blanks":
+        tables_to_scan = [(TABLE_BLANKS, "Blanks")]
+    else:
+        tables_to_scan = [
+            (TABLE_POSTING, "Posting"),
+            (TABLE_WARMUP, "Warmup"),
+            (TABLE_BLANKS, "Blanks"),
+        ]
+
+    stage_names = ", ".join(s for _, s in tables_to_scan)
+    await reply(update, f"🔧 <b>Recovery mode</b>: checking all 'Banned' accounts in {stage_names}.\n\nEvery account that's actually alive on Reddit will be reverted.\nProcessing in batches of {BATCH_SIZE}...", parse_mode=ParseMode.HTML)
+
+    try:
+        total_checked = 0
+        total_reverted = 0
+        total_actually_banned = 0
+        errors = 0
+        reverted_details = []
+
+        for table_id, stage in tables_to_scan:
+            records = get_table(table_id).all()
+            banned = [r for r in records if safe_get(r, "Status") in ("Banned", "Shadowbanned")]
+
+            if not banned:
+                await reply(update, f"📋 <b>{stage}</b>: no banned accounts to check.", parse_mode=ParseMode.HTML)
+                continue
+
+            # Filter to those with usernames
+            to_check = [(r, safe_get(r, "Reddit Username", "").strip()) for r in banned]
+            to_check = [(r, u) for r, u in to_check if u]
+
+            await reply(update, f"📋 <b>{stage}</b>: checking {len(to_check)} banned accounts...", parse_mode=ParseMode.HTML)
+
+            stage_reverted = 0
+            for i, (r, username) in enumerate(to_check):
+                if i > 0 and i % BATCH_SIZE == 0:
+                    await reply(
+                        update,
+                        f"⏳ {stage}: checked {i}/{len(to_check)} — pausing {BATCH_PAUSE}s...",
+                    )
+                    await asyncio.sleep(BATCH_PAUSE)
+
+                total_checked += 1
+                profile = await fetch_reddit_profile(username)
+
+                if not profile:
+                    errors += 1
+                    await asyncio.sleep(REQUEST_DELAY)
+                    continue
+
+                if profile.get("rate_limited"):
+                    await reply(update, f"⚠️ Rate limited during {stage} recovery, waiting {RATE_LIMIT_PAUSE}s...")
+                    await asyncio.sleep(RATE_LIMIT_PAUSE)
+                    profile = await fetch_reddit_profile(username)
+                    if not profile or profile.get("rate_limited"):
+                        errors += 1
+                        continue
+
+                if profile.get("suspended"):
+                    # Actually banned — leave as is
+                    total_actually_banned += 1
+                    await asyncio.sleep(REQUEST_DELAY)
+                    continue
+
+                # Account is ALIVE — revert status
+                revert_to = REVERT_STATUS.get(table_id, "Available")
+                try:
+                    update_fields = {"Status": revert_to}
+                    # Also update karma/age while we're at it
+                    if profile.get("post_karma") is not None:
+                        update_fields["Post Karma"] = profile["post_karma"]
+                    if profile.get("comment_karma") is not None:
+                        update_fields["Comment Karma"] = profile["comment_karma"]
+                    if profile.get("account_age"):
+                        update_fields["Account Age"] = profile["account_age"]
+                    get_table(table_id).update(r["id"], update_fields)
+                    stage_reverted += 1
+                    total_reverted += 1
+
+                    # Remove from known_bans so poll_bans doesn't skip it
+                    _cfg = load_config()
+                    _known = set(_cfg.get("known_bans", []))
+                    _known.discard(f"{table_id}:{username}")
+                    _cfg["known_bans"] = list(_known)
+                    save_config(_cfg)
+
+                    va = safe_get(r, "VA", safe_get(r, "Created By", "N/A"))
+                    reverted_details.append(f"✅ <b>u/{esc(username)}</b> — {stage} → {revert_to} ({va})")
+                except Exception as e:
+                    logger.error(f"Revert error for u/{username}: {e}")
+                    errors += 1
+
+                await asyncio.sleep(REQUEST_DELAY)
+
+            await reply(
+                update,
+                f"✅ <b>{stage}</b> done: {stage_reverted} reverted, {len(to_check) - stage_reverted} actually banned",
+                parse_mode=ParseMode.HTML,
+            )
+
+        # Final summary
+        text = (
+            f"<b>🔧 Recovery Complete</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 Checked: <b>{total_checked}</b> banned accounts\n"
+            f"✅ Reverted: <b>{total_reverted}</b> (were alive)\n"
+            f"🚫 Actually banned: <b>{total_actually_banned}</b>\n"
+        )
+        if errors:
+            text += f"⚠️ Errors: {errors}\n"
+
+        if reverted_details:
+            text += f"\n{'━' * 18}\n\n"
+            for d in reverted_details[:40]:
+                text += f"{d}\n"
+            if len(reverted_details) > 40:
+                text += f"\n<i>...and {len(reverted_details) - 40} more</i>\n"
+            text += f"\n\n<i>All alive accounts restored + karma updated</i>"
+        else:
+            text += f"\n<i>All banned accounts are genuinely banned — no changes needed.</i>"
+
+        await reply(update, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"recoverbans error: {e}\n{traceback.format_exc()}")
+        await reply(update, f"Error during recovery: {e}")
+
+
 # ── /postcheck ── Quick shadowban / account status check ─────────────────────
 
 
@@ -2489,6 +2642,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Account Tools</b>\n"
         "  /refresh — Update karma/age from Reddit\n"
         "  /checkbans — Scan all stages for Reddit bans\n"
+        "  /recoverbans [posting|warmup|blanks] — Fix wrongly banned accounts\n"
         "  /postcheck — Shadowban checker\n"
         "  /topaccs — Highest karma accounts\n"
         "  /warnings — Accounts needing attention\n\n"
@@ -4152,6 +4306,7 @@ def main():
     # Account tools
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(CommandHandler("checkbans", checkbans_cmd))
+    app.add_handler(CommandHandler("recoverbans", recoverbans_cmd))
     app.add_handler(CommandHandler("postcheck", postcheck_cmd))
     app.add_handler(CommandHandler("reassign", assign_acc_cmd))
     app.add_handler(CommandHandler("topaccs", topaccs_cmd))
@@ -4248,6 +4403,7 @@ def main():
             # --- Account Tools ---
             ("refresh", "Update karma/age from Reddit"),
             ("checkbans", "Scan all stages for bans"),
+            ("recoverbans", "Fix wrongly banned accounts"),
             ("postcheck", "Shadowban checker"),
             ("topaccs", "Highest karma accounts"),
             ("warnings", "Accounts needing attention"),
