@@ -916,6 +916,68 @@ async def recoverbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, f"Error during recovery: {e}")
 
 
+# ── /revertbans ── Force revert all Banned back without checking Reddit ──────
+
+
+async def revertbans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force revert all Banned accounts back to active status — no Reddit check."""
+    if not await is_admin(update, context):
+        return await reply(update, "Admin only.")
+
+    REVERT_MAP = {
+        "posting": (TABLE_POSTING, "Posting", ["Banned"]),
+        "warmup": (TABLE_WARMUP, "Warming", ["Banned"]),
+        "blanks": (TABLE_BLANKS, "Available", ["Banned"]),
+    }
+
+    args = context.args
+    if not args or args[0].lower() not in REVERT_MAP:
+        return await reply(update, "Usage: /revertbans posting|warmup|blanks")
+
+    target = args[0].lower()
+    table_id, revert_to, ban_statuses = REVERT_MAP[target]
+
+    await reply(update, f"🔧 Force-reverting ALL 'Banned' → '{revert_to}' in <b>{target.title()}</b>...\nNo Reddit check — just flipping statuses.", parse_mode=ParseMode.HTML)
+
+    try:
+        records = get_table(table_id).all()
+        banned = [r for r in records if safe_get(r, "Status") in ban_statuses]
+
+        if not banned:
+            return await reply(update, f"✅ No banned accounts found in {target.title()} table.")
+
+        reverted = 0
+        errors = 0
+
+        for r in banned:
+            username = safe_get(r, "Reddit Username", "").strip()
+            try:
+                get_table(table_id).update(r["id"], {"Status": revert_to})
+                reverted += 1
+                _cfg = load_config()
+                _known = set(_cfg.get("known_bans", []))
+                _known.discard(f"{table_id}:{username}")
+                _cfg["known_bans"] = list(_known)
+                save_config(_cfg)
+            except Exception as e:
+                logger.error(f"Revert error for u/{username}: {e}")
+                errors += 1
+            await asyncio.sleep(0.3)
+
+        text = (
+            f"<b>🔧 Force Revert Done</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ Reverted: <b>{reverted}</b> accounts → {revert_to}\n"
+        )
+        if errors:
+            text += f"⚠️ Errors: {errors}\n"
+        text += f"\n<i>Genuinely banned ones will be re-caught by the next scheduled scan.</i>"
+        await reply(update, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"revertbans error: {e}\n{traceback.format_exc()}")
+        await reply(update, f"Error: {e}")
+
+
 # ── /postcheck ── Quick shadowban / account status check ─────────────────────
 
 
@@ -4307,6 +4369,7 @@ def main():
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(CommandHandler("checkbans", checkbans_cmd))
     app.add_handler(CommandHandler("recoverbans", recoverbans_cmd))
+    app.add_handler(CommandHandler("revertbans", revertbans_cmd))
     app.add_handler(CommandHandler("postcheck", postcheck_cmd))
     app.add_handler(CommandHandler("reassign", assign_acc_cmd))
     app.add_handler(CommandHandler("topaccs", topaccs_cmd))
