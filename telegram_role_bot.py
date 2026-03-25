@@ -1806,11 +1806,11 @@ async def settopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         return await reply(update, "Admin only.")
 
-    if len(context.args) < 2:
-        return await reply(update, "Usage: /settopic <VA_name> <Model>\nExample: /settopic Lakshit Celes")
+    if len(context.args) < 1:
+        return await reply(update, "Usage: /settopic <VA_name> [Model]\nExample: /settopic Lakshit\nModel is optional — auto-detected from KM Posters table.")
 
     va_name = context.args[0]
-    model = context.args[1]
+    model = context.args[1] if len(context.args) >= 2 else ""
     thread_id = update.message.message_thread_id
 
     if not thread_id:
@@ -1822,7 +1822,8 @@ async def settopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg.setdefault("topics", {})[key] = {"va": va_name, "model": model, "thread_id": thread_id, "chat_id": chat_id}
     save_config(cfg)
 
-    await reply(update, f"✅ This topic is now logging for <b>{va_name}</b> [{model}]", parse_mode=ParseMode.HTML)
+    model_text = f" [{model}]" if model else " [auto-detect from Airtable]"
+    await reply(update, f"✅ This topic → <b>{va_name}</b>{model_text}\nPosts will be silently logged.", parse_mode=ParseMode.HTML)
 
 
 async def unsettopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1917,124 +1918,304 @@ async def linkva_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, f"✅ Linked {display_name} → <b>{va_name}</b>", parse_mode=ParseMode.HTML)
 
 
-# ── Auto link detection ── Reddit URL message handler ─────────────────────────
+# ── Silent Post Logger ────────────────────────────────────────────────────────
+# Watches VA channels for Reddit links, fetches post data from Reddit,
+# cross-references KM Posters for VA/Model/Location, logs to Post Logs table.
+# Completely silent — never sends messages in VA channels.
+
+# Main base Post Logs table
+MAIN_BASE_ID = "app03VvIaMTUeC1ai"
+MAIN_AIRTABLE_TOKEN = os.environ.get("MAIN_AIRTABLE_TOKEN", "").strip()
+TABLE_POST_LOGS_MAIN = "tbl5WmMJOp4KY6ZD7"
+TABLE_KM_POSTERS = "tblu1SwOC5EcZn9qz"
+
+# Post Logs field IDs
+PL_POST_URL = "fldBkPMuo7A0O4MnK"
+PL_USERNAME = "fldb1HaJhOxMisGyV"
+PL_VA = "fld945zqsbdFZUPFN"
+PL_MODEL = "fldmX0nXzfKhbLiKC"
+PL_LOCATION = "fldG4T476cTJH3pK5"
+PL_SUBREDDIT = "flddY6gRRJCBPQqxN"
+PL_TITLE = "fldcgkYCYqatwFyTC"
+PL_DATE = "fld0OUtQpFH6MGZDG"
+PL_TIME = "fldCr1B5CQAXn5WPm"
+PL_DAY = "fldvmPmBPVHvUvfD7"
+PL_LOGGED_AT = "fld58FczNToSJFSUp"
+
+# Upvote tracking field IDs — checked at intervals after post creation
+UPVOTE_FIELDS = {
+    2: "fldDdmLq4lIsGPlSG",   # 2h Upvotes
+    4: "fld3O3pWMkTSInIV6",   # 4h Upvotes
+    8: "fld49vqbaweP5xZjX",   # 8h Upvotes
+    16: "fldq99dh2mLxWaoMq",  # 16h Upvotes
+    24: "fldElP15jWzpDCqlY",  # 24h Upvotes
+    36: "fldwqQj9Vnrch3eHg",  # 36h Upvotes
+    48: "fldO3RRbVbpkrYCUh",  # 48h Upvotes
+}
+UPVOTE_CHECK_INTERVAL = 1800  # Run upvote checker every 30 min
+
+# Cache of KM Posters accounts: {username_lower: {va, model, location}}
+_km_posters_cache = {}
+_km_posters_cache_time = 0
+KM_POSTERS_CACHE_TTL = 300  # refresh every 5 min
+
+DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+_main_api = None
+
+
+def get_main_api():
+    global _main_api
+    if _main_api is None:
+        token = MAIN_AIRTABLE_TOKEN or AIRTABLE_TOKEN
+        _main_api = Api(token)
+    return _main_api
+
+
+def get_main_table(table_id):
+    return get_main_api().table(MAIN_BASE_ID, table_id)
+
+
+def refresh_km_posters_cache():
+    """Refresh the KM Posters lookup cache."""
+    global _km_posters_cache, _km_posters_cache_time
+    import time
+    now = time.time()
+    if now - _km_posters_cache_time < KM_POSTERS_CACHE_TTL and _km_posters_cache:
+        return
+
+    try:
+        records = get_main_table(TABLE_KM_POSTERS).all()
+        cache = {}
+        for r in records:
+            f = r.get("fields", {})
+            username = f.get("Username", "")
+            if not username:
+                continue
+
+            # Handle singleSelect VA field (could be dict or string)
+            va_raw = f.get("Assigned VA", "")
+            va = va_raw.get("name", "") if isinstance(va_raw, dict) else (va_raw or "")
+
+            model_raw = f.get("Model", "")
+            model = model_raw.get("name", "") if isinstance(model_raw, dict) else (model_raw or "")
+
+            location = f.get("Location", "") or ""
+
+            cache[username.lower()] = {"va": va, "model": model, "location": location}
+
+        _km_posters_cache = cache
+        _km_posters_cache_time = now
+        logger.info(f"KM Posters cache refreshed: {len(cache)} accounts")
+    except Exception as e:
+        logger.error(f"Failed to refresh KM Posters cache: {e}")
+
+
+async def fetch_reddit_post_info(url: str) -> dict | None:
+    """Fetch post author, subreddit, and title from a Reddit post URL."""
+    # Normalize URL to .json endpoint
+    clean_url = url.split("?")[0].rstrip("/")
+
+    # Handle /s/ share links by following redirect
+    if "/s/" in clean_url:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.head(clean_url, follow_redirects=True, timeout=10,
+                                         headers={"User-Agent": "bot:post-logger:v1.0"})
+                clean_url = str(resp.url).split("?")[0].rstrip("/")
+        except Exception:
+            return None
+
+    if "/comments/" not in clean_url:
+        return None
+
+    json_url = clean_url + ".json"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(json_url, timeout=15, follow_redirects=True,
+                                    headers={"User-Agent": "bot:post-logger:v1.0"})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                post_data = data[0].get("data", {}).get("children", [{}])[0].get("data", {})
+                return {
+                    "author": post_data.get("author", ""),
+                    "subreddit": post_data.get("subreddit", ""),
+                    "title": post_data.get("title", ""),
+                }
+    except Exception as e:
+        logger.error(f"Failed to fetch Reddit post info: {e}")
+    return None
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Silent post logger — detects Reddit links, logs to Airtable, never replies."""
     if not update.message or not update.message.text:
         return
 
     thread_id = update.message.message_thread_id
     if not thread_id:
-        return  # Only process messages in forum topics
+        return
 
     chat_id = str(update.effective_chat.id)
     topic_cfg = get_topic_config(chat_id, thread_id)
     if not topic_cfg:
-        return  # Not a configured logging topic
+        return
 
-    # Find Reddit URLs in the message
+    # Find Reddit URLs
     urls = REDDIT_URL_PATTERN.findall(update.message.text)
     if not urls:
         return
 
-    va_name = topic_cfg["va"]
-    model = topic_cfg["model"]
+    # Fallback VA/model from topic config
+    topic_va = topic_cfg.get("va", "")
+    topic_model = topic_cfg.get("model", "")
 
-    # Check for duplicates and log each URL
-    cfg = load_config()
-    logged_urls = set()
-    existing_logs = None  # Lazy load
+    # Refresh account cache
+    refresh_km_posters_cache()
 
-    results = []
     for url in urls:
         url = url.strip()
 
-        # Check for duplicate
-        if existing_logs is None:
-            try:
-                existing_logs = get_table(TABLE_POSTING_LOGS).all()
-                logged_urls = {safe_get(r, "Post URL", "").strip().lower() for r in existing_logs}
-            except Exception:
-                logged_urls = set()
-
-        if url.lower() in logged_urls:
-            results.append(f"⚠️ Duplicate: {url}")
-            continue
-
-        # Validate it's a post URL (not just a user profile)
+        # Only log post URLs
         if "/comments/" not in url and "/s/" not in url:
-            results.append(f"⚠️ Not a post URL: {url}")
             continue
 
-        # Find the Reddit account in Posting table
-        reddit_account_id = None
         try:
-            posting_records = get_table(TABLE_POSTING).all()
-            # Try to extract subreddit username from post URL isn't reliable
-            # Instead, we just log with VA info
-        except Exception:
-            pass
+            # Fetch post info from Reddit
+            post_info = await fetch_reddit_post_info(url)
 
-        # Create the posting log record
-        try:
-            record_data = {"Post URL": url}
-            # Link to VA record if possible
-            try:
-                vas_table = get_table(TABLE_VAS).all()
-                for v in vas_table:
-                    if safe_get(v, "VA Name") == va_name:
-                        record_data["VAs"] = [v["id"]]
-                        break
-            except Exception:
-                pass
+            author = ""
+            subreddit = ""
+            title = ""
+            va = topic_va
+            model = topic_model
+            location = ""
 
-            get_table(TABLE_POSTING_LOGS).create(record_data)
-            results.append(f"✅ Logged: {url}")
-            logged_urls.add(url.lower())  # Prevent duplicate within same message
+            if post_info:
+                author = post_info.get("author", "")
+                subreddit = post_info.get("subreddit", "")
+                title = post_info.get("title", "")
+
+                # Cross-reference with KM Posters
+                if author:
+                    account_info = _km_posters_cache.get(author.lower())
+                    if account_info:
+                        va = account_info["va"] or topic_va
+                        model = account_info["model"] or topic_model
+                        location = account_info["location"] or ""
+
+            # Build the record
+            now = now_ist()
+            record = {
+                PL_POST_URL: url,
+                PL_USERNAME: author,
+                PL_VA: va,
+                PL_SUBREDDIT: f"r/{subreddit}" if subreddit else "",
+                PL_TITLE: title[:100] if title else "",
+                PL_DATE: now.strftime("%Y-%m-%d"),
+                PL_TIME: now.strftime("%H:%M"),
+                PL_DAY: DAYS_OF_WEEK[now.weekday()],
+                PL_LOGGED_AT: now_utc().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            }
+
+            # Model as singleSelect
+            if model:
+                record[PL_MODEL] = model
+
+            if location:
+                record[PL_LOCATION] = location
+
+            get_main_table(TABLE_POST_LOGS_MAIN).create(record)
+            logger.info(f"Post logged: u/{author} on r/{subreddit} — {va} [{model}]")
+
         except Exception as e:
-            results.append(f"❌ Failed: {url} — {e}")
-            logger.error(f"Log post error: {e}")
-
-    if results:
-        key = (chat_id, thread_id)
-        for r in results:
-            _pending_post_logs[key].append((va_name, model, r))
+            logger.error(f"Silent post log error for {url}: {e}")
 
 
 async def flush_post_logs(context: ContextTypes.DEFAULT_TYPE):
-    """Send batched post log summaries every few hours."""
-    if not _pending_post_logs:
+    """No longer sends messages in channels — kept as no-op for compatibility."""
+    pass
+
+
+async def check_post_upvotes(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job: check upvotes on logged posts at 2/4/8/16/24/36/48h marks."""
+    try:
+        records = get_main_table(TABLE_POST_LOGS_MAIN).all()
+    except Exception as e:
+        logger.error(f"Upvote checker: failed to fetch post logs: {e}")
         return
 
-    pending = dict(_pending_post_logs)
-    _pending_post_logs.clear()
+    now = datetime.now(timezone.utc)
+    updates_made = 0
 
-    for (chat_id, thread_id), entries in pending.items():
-        # Group by VA name + model
-        by_va: dict[str, list[str]] = defaultdict(list)
-        for va_name, model, line in entries:
-            by_va[f"{va_name} [{model}]"].append(line)
+    for record in records:
+        f = record.get("fields", {})
+        post_url = f.get("Post URL", "")
+        logged_at_str = f.get("Logged At", "")
 
-        lines = []
-        for va_label, logs in by_va.items():
-            lines.append(f"<b>📝 {va_label}</b>")
-            lines.extend(logs)
-            lines.append("")
+        if not post_url or not logged_at_str:
+            continue
 
-        text = f"<b>📋 Post Log Summary — {len(entries)} posts</b>\n\n" + "\n".join(lines)
+        # Parse logged_at
+        try:
+            logged_at = datetime.fromisoformat(logged_at_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        hours_since = (now - logged_at).total_seconds() / 3600
+
+        # Find which upvote fields need filling
+        fields_to_check = []
+        for hour_mark, field_id in UPVOTE_FIELDS.items():
+            field_name = f"{hour_mark}h Upvotes"
+            if hours_since >= hour_mark and f.get(field_name) is None:
+                fields_to_check.append((hour_mark, field_id))
+
+        if not fields_to_check:
+            continue
+
+        # Skip posts older than 50h with all fields filled
+        if hours_since > 50:
+            continue
+
+        # Fetch current upvotes from Reddit
+        clean_url = post_url.split("?")[0].rstrip("/")
+        if "/comments/" not in clean_url:
+            continue
 
         try:
-            kwargs = {
-                "chat_id": int(chat_id),
-                "text": text,
-                "parse_mode": ParseMode.HTML,
-                "disable_notification": True,
-            }
-            if thread_id:
-                kwargs["message_thread_id"] = thread_id
-            await context.bot.send_message(**kwargs)
+            await reddit._throttle()
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    clean_url + ".json", timeout=15, follow_redirects=True,
+                    headers={"User-Agent": "bot:post-logger:v1.0"}
+                )
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    post_data = data[0].get("data", {}).get("children", [{}])[0].get("data", {})
+                    upvotes = post_data.get("ups", 0)
+                else:
+                    continue
+        except Exception:
+            continue
+
+        # Update all due fields with current upvote count
+        update = {}
+        for hour_mark, field_id in fields_to_check:
+            update[field_id] = upvotes
+
+        try:
+            get_main_table(TABLE_POST_LOGS_MAIN).update(record["id"], update)
+            updates_made += 1
         except Exception as e:
-            logger.error(f"Failed to flush post logs: {e}")
+            logger.error(f"Upvote update failed for {post_url}: {e}")
+
+    if updates_made:
+        logger.info(f"Upvote checker: updated {updates_made} posts")
 
 
 async def post_activity_report(context: ContextTypes.DEFAULT_TYPE):
@@ -4001,6 +4182,7 @@ def main():
     if job_queue:
         job_queue.run_repeating(poll_bans, interval=BAN_POLL_INTERVAL, first=30)
         job_queue.run_repeating(flush_post_logs, interval=POST_LOG_FLUSH_INTERVAL, first=POST_LOG_FLUSH_INTERVAL)
+        job_queue.run_repeating(check_post_upvotes, interval=UPVOTE_CHECK_INTERVAL, first=300)
         job_queue.run_repeating(
             update_account_info_job,
             interval=ACCOUNT_UPDATE_INTERVAL,
